@@ -5270,11 +5270,6 @@ class ClickHouseInstance:
         # left over from an earlier server reads as this one's exit.
         self.clickhouse_last_exit_code = None
         self.clickhouse_forced_stop = False
-        # The same verdict for the server a version-swap helper replaced. Held apart
-        # because those helpers stop and start in one call, leaving the caller no window
-        # to read the fields above before the replacement resets them.
-        self.clickhouse_preswap_exit_code = None
-        self.clickhouse_preswap_forced_stop = False
         # Filled by `probe_slow_build()`; `None` until the server has been asked successfully.
         self._is_slow_build = None
 
@@ -6233,13 +6228,12 @@ class ClickHouseInstance:
         """Stop the server so a version-swap helper can replace its binary.
 
         Not `stop_clickhouse`: these helpers stop with a caller-chosen signal and start the
-        replacement themselves. The bookkeeping a stop owes is the same though - the exit
-        code of the exec that just ended, and whether the stop had to escalate to SIGKILL -
-        so a server that hung on shutdown is not reported as a clean restart.
+        replacement themselves. The verdict is reported here rather than left on the
+        instance, because the replacement starts in the same call and resets those fields
+        before any caller gets a window to read them.
         """
-        # Both describe the stop that is about to happen. Cleared here rather than at the
-        # start below, so what this one learns survives into the replacement server and a
-        # second swap cannot leave the first one's verdict standing.
+        # Both describe the stop that is about to happen, so an earlier server's verdict
+        # must not be standing when the escalation check below reads them.
         self.clickhouse_last_exit_code = None
         self.clickhouse_forced_stop = False
         self.exec_in_container(
@@ -6256,10 +6250,14 @@ class ClickHouseInstance:
 
         # force kill if server hangs
         if self.get_process_pid("clickhouse server"):
-            logging.warning(
-                f"Force kill clickhouse on {self.name}: it did not stop on signal {signal}"
+            logging.error(
+                f"Server {self.name} did not shut down on signal {signal} and had to be force "
+                "killed before a binary swap"
             )
             self.clickhouse_forced_stop = True
+            # While it is still alive: after the kill below there is nothing left to dump,
+            # and this is where a shutdown hang is diagnosable.
+            self.dump_backtrace("on forced stop before binary swap")
             # server can die before kill, so don't throw exception, it's expected
             self.exec_in_container(
                 ["bash", "-c", "pkill -{} clickhouse".format(9)],
@@ -6267,17 +6265,17 @@ class ClickHouseInstance:
                 user="root",
             )
         self._capture_clickhouse_exit()
+        logging.debug(
+            f"Server {self.name} stopped for a binary swap with exit code "
+            f"{self.clickhouse_last_exit_code}"
+        )
 
     def _start_after_binary_swap(self):
         """Start the replacement server of a version-swap helper.
 
-        The exec id has to go: this start daemonizes, so the exec is a launcher that exits 0
-        once it has forked, and its code says nothing about how the server later went away.
-        The stop verdict belongs to the server being replaced, so it moves to the `preswap`
-        fields - left in place it would be read as the replacement's own exit.
+        This start daemonizes, so the exec is a launcher that exits 0 once forked. Its id
+        and the stop verdict both belong to the replaced server, and go with it.
         """
-        self.clickhouse_preswap_exit_code = self.clickhouse_last_exit_code
-        self.clickhouse_preswap_forced_stop = self.clickhouse_forced_stop
         self.clickhouse_last_exit_code = None
         self.clickhouse_forced_stop = False
         self.clickhouse_exec_id = ""
